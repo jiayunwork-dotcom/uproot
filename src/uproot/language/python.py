@@ -349,6 +349,99 @@ class PythonLanguage(uproot.language.Language):
         """
         return self._getter
 
+    def _name_to_array(self, hasbranches, arrays, expression_context, keys):
+        """
+        Builds the ``values`` mapping used by :doc:`compute_expressions` and
+        :doc:`compute_cut`: branch names (including the aliases of nested
+        branches) to arrays.
+        """
+        values = {}
+        for _, context in expression_context:
+            for branch in context["branches"]:
+                if branch.cache_key not in arrays:
+                    continue
+                array = arrays[branch.cache_key]
+                name = branch.name
+                while branch is not hasbranches:
+                    if name in keys:
+                        values[name] = array
+                    branch = branch.parent  # noqa: PLW2901 (overwriting branch)
+                    if branch is not hasbranches:
+                        name = branch.name + "/" + name
+                name = "/" + name
+                if name in keys:
+                    values[name] = array
+        return values
+
+    def _cut_function(
+        self, expression, keys, aliases, values, file_path, object_path
+    ):
+        """
+        Compiles the cut ``expression`` into a function, with aliases resolved
+        through the same getter mechanism as :doc:`compute_expressions`.
+        """
+
+        def getter(name):
+            if name not in values:
+                values[name] = _expression_to_function(
+                    aliases[name],
+                    keys,
+                    aliases,
+                    self._functions,
+                    self._getter,
+                    scope,
+                    file_path,
+                    object_path,
+                )()
+            return values[name]
+
+        scope = {self._getter: getter, "function": self._functions}
+        return _expression_to_function(
+            expression,
+            keys,
+            aliases,
+            self._functions,
+            self._getter,
+            scope,
+            file_path,
+            object_path,
+        )()
+
+    def compute_cut(
+        self,
+        hasbranches,
+        arrays,
+        expression_context,
+        keys,
+        aliases,
+        file_path,
+        object_path,
+    ):
+        """
+        Args:
+            hasbranches (:doc:`uproot.behaviors.TBranch.HasBranches`): The
+                ``TTree`` or ``TBranch`` that is requesting a computation.
+            arrays (dict of arrays): Inputs to the computation.
+            expression_context (list of (str, dict) tuples): Expression strings
+                and a dict of metadata about each.
+            keys (set of str): Names of branches or aliases (for aliases that
+                refer to aliases).
+            aliases (dict of str → str): Names of aliases and their definitions.
+            file_path (str): File path for error messages.
+            object_path (str): Object path for error messages.
+
+        Computes only the cut expression (if there is one) and returns its
+        value. This is used by staged ``cut`` reading, which needs the
+        per-event selection before any output-only branches are read.
+        """
+        values = self._name_to_array(hasbranches, arrays, expression_context, keys)
+        for expression, context in expression_context:
+            if context["is_primary"] and context["is_cut"]:
+                return self._cut_function(
+                    expression, keys, aliases, values, file_path, object_path
+                )
+        return None
+
     def getter_of(self, name):
         """
         Returns a string, an expression in which the ``getter`` is getting
@@ -398,6 +491,7 @@ class PythonLanguage(uproot.language.Language):
         aliases,
         file_path,
         object_path,
+        cut_already_applied=False,
     ):
         """
         Args:
@@ -411,6 +505,9 @@ class PythonLanguage(uproot.language.Language):
             aliases (dict of str \u2192 str): Names of aliases and their definitions.
             file_path (str): File path for error messages.
             object_path (str): Object path for error messages.
+            cut_already_applied (bool): If True, the arrays have already been
+                filtered to the surviving entries, so the cut expression is not
+                evaluated or applied again (used by staged ``cut`` reading).
 
         Computes an array for each expression.
         """
@@ -443,19 +540,9 @@ class PythonLanguage(uproot.language.Language):
             return values[name]
 
         scope = {self._getter: getter, "function": self._functions}
-        for _, context in expression_context:
-            for branch in context["branches"]:
-                array = arrays[branch.cache_key]
-                name = branch.name
-                while branch is not hasbranches:
-                    if name in keys:
-                        values[name] = array
-                    branch = branch.parent  # noqa: PLW2901 (overwriting branch)
-                    if branch is not hasbranches:
-                        name = branch.name + "/" + name
-                name = "/" + name
-                if name in keys:
-                    values[name] = array
+        values.update(
+            self._name_to_array(hasbranches, arrays, expression_context, keys)
+        )
 
         output = {}
         is_pandas = False
@@ -475,6 +562,8 @@ class PythonLanguage(uproot.language.Language):
                     is_pandas = True
 
         cut = None
+        if cut_already_applied:
+            return output
         for expression, context in expression_context:
             if context["is_primary"] and context["is_cut"]:
                 cut = _expression_to_function(

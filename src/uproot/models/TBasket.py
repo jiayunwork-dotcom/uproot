@@ -112,6 +112,9 @@ class Model_TBasket(uproot.model.Model):
         """
         count_branch = self._parent.count_branch
         if count_branch is not None:
+            staged_counts = getattr(self, "_staged_counts", None)
+            if staged_counts is not None:
+                return staged_counts
             entry_offsets = count_branch.entry_offsets
             entry_start = entry_offsets[self._basket_num]
             entry_stop = entry_offsets[self._basket_num + 1]

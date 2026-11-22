@@ -66,6 +66,8 @@ def iterate(
     report=False,
     custom_classes=None,
     allow_missing=False,
+    cut_mode="eager",
+    cut_extra_bytes=0,
     **options,
 ):
     """
@@ -126,6 +128,18 @@ def iterate(
             the :doc:`uproot.reading.ReadOnlyFile` or ``uproot.classes``.
         allow_missing (bool): If True, skip over any files that do not contain
             the specified ``TTree``.
+        cut_mode (str): Either ``"eager"`` (default) or ``"staged"``. In
+            ``"eager"`` mode, all branches needed by ``cut`` and by the output
+            ``expressions`` are read before the selection is applied. In
+            ``"staged"`` mode, only the branches that ``cut`` depends on are
+            read first; the output branches are then read from only the
+            ``TBaskets`` that contain surviving entries (see
+            ``cut_extra_bytes``). If ``cut`` is None, ``"staged"`` is the same
+            as an ordinary read.
+        cut_extra_bytes (int): Only used by ``cut_mode="staged"``; a
+            non-negative number of extra compressed bytes (summed across all
+            output branches) that may be spent reading payload ``TBaskets``
+            that do not contain surviving entries.
         options: See below.
 
     Iterates through contiguous chunks of entries from a set of files.
@@ -183,6 +197,8 @@ def iterate(
         decompression_executor, interpretation_executor, None
     )
     library = uproot.interpretation.library._regularize_library(library)
+    cut_mode = _regularize_cut_mode(cut_mode)
+    cut_extra_bytes = _regularize_cut_extra_bytes(cut_extra_bytes)
 
     global_offset = 0
     for file_path, object_path in files:
@@ -208,6 +224,8 @@ def iterate(
                         ak_add_doc=ak_add_doc,
                         how=how,
                         report=report,
+                        cut_mode=cut_mode,
+                        cut_extra_bytes=cut_extra_bytes,
                     ):
                         if report:
                             arrays, report = item
@@ -748,6 +766,8 @@ class HasBranches(Mapping):
         how=None,
         virtual=False,
         access_log=None,
+        cut_mode="eager",
+        cut_extra_bytes=0,
     ):
         """
         Args:
@@ -809,6 +829,15 @@ class HasBranches(Mapping):
             access_log (None or object with a ``__iadd__`` method): If an access_log is
                 provided, e.g. a list, all materializations of the arrays are
                 tracked inside this reference. Only applies if ``virtual=True``.
+            cut_mode (str): Either ``"eager"`` (default) or ``"staged"``. See
+                :ref:`uproot.behaviors.TBranch.HasBranches.iterate` for details.
+                In ``"staged"`` mode, only the branches needed by ``cut`` are
+                read before the selection is applied; output branches are then
+                read from only the ``TBaskets`` with surviving entries.
+            cut_extra_bytes (int): Only used by ``cut_mode="staged"``; a
+                non-negative number of extra compressed bytes (summed across all
+                output branches) that may be spent reading payload ``TBaskets``
+                without surviving entries.
 
         Returns a group of arrays from the ``TTree``.
 
@@ -853,6 +882,12 @@ class HasBranches(Mapping):
             if aliases is not None:
                 raise ValueError(err("aliases"))
 
+            if cut_mode != "eager" or cut_extra_bytes != 0:
+                # `virtual=True` already forbids `cut`, so a staged read would
+                # be an ordinary read anyway; only reject malformed values.
+                _regularize_cut_mode(cut_mode)
+                _regularize_cut_extra_bytes(cut_extra_bytes)
+
             return self._virtual_arrays(
                 filter_name=filter_name,
                 filter_typename=filter_typename,
@@ -887,6 +922,8 @@ class HasBranches(Mapping):
                 library=library,
                 ak_add_doc=ak_add_doc,
                 how=how,
+                cut_mode=cut_mode,
+                cut_extra_bytes=cut_extra_bytes,
             )
 
     def _virtual_arrays(
@@ -1055,6 +1092,8 @@ class HasBranches(Mapping):
         library="ak",
         ak_add_doc=False,
         how=None,
+        cut_mode="eager",
+        cut_extra_bytes=0,
     ):
         """
         Args:
@@ -1147,7 +1186,12 @@ class HasBranches(Mapping):
                 array_cache=array_cache,
                 library=library,
                 how=how,
+                cut_mode=cut_mode,
+                cut_extra_bytes=cut_extra_bytes,
             )
+
+        cut_mode = _regularize_cut_mode(cut_mode)
+        cut_extra_bytes = _regularize_cut_extra_bytes(cut_extra_bytes)
 
         entry_start, entry_stop = _regularize_entries_start_stop(
             self.tree.num_entries, entry_start, entry_stop
@@ -1157,6 +1201,9 @@ class HasBranches(Mapping):
         )
         array_cache = _regularize_array_cache(array_cache, self._file)
         library = uproot.interpretation.library._regularize_library(library)
+
+        if cut_mode == "staged" and cut is not None:
+            _staged_check_language_library(language, library)
 
         def get_from_cache(branchname, interpretation):
             if array_cache is not None:
@@ -1178,6 +1225,36 @@ class HasBranches(Mapping):
             language,
             get_from_cache,
         )
+
+        if cut_mode == "staged":
+            has_cut = cut is not None and any(
+                c["is_cut"] for _, c in expression_context
+            )
+            if has_cut:
+                output, _next_baskets = _staged_cut_arrays(
+                    self,
+                    arrays,
+                    expression_context,
+                    branchid_interpretation,
+                    entry_start,
+                    entry_stop,
+                    decompression_executor,
+                    interpretation_executor,
+                    library,
+                    keys,
+                    aliases,
+                    language,
+                    ak_add_doc,
+                    how,
+                    cut_extra_bytes,
+                    previous_baskets=None,
+                    use_cache=True,
+                )
+                # Do not let a staged (partial) selection leak into the array
+                # cache. Any full-range entries that were used from the cache
+                # are still valid; nothing partial is stored here.
+                return output
+            # with no cut, staged is an ordinary read
 
         ranges_or_baskets = []
         checked = set()
@@ -1272,6 +1349,8 @@ class HasBranches(Mapping):
         ak_add_doc=False,
         how=None,
         report=False,
+        cut_mode="eager",
+        cut_extra_bytes=0,
     ):
         """
         Args:
@@ -1333,6 +1412,17 @@ class HasBranches(Mapping):
                 (arrays, :doc:`uproot.behaviors.TBranch.Report`) pairs; if False,
                 it only yields arrays. The report has data about the ``TFile``,
                 ``TTree``, and global and local entry ranges.
+            cut_mode (str): Either ``"eager"`` (default) or ``"staged"``. In
+                ``"staged"`` mode only the branches needed by ``cut`` are read
+                first; output branches are then read from only the
+                ``TBaskets`` with surviving entries. ``step_size``, the
+                ``Report`` ranges, and the set of minified/empty steps are all
+                unchanged. See
+                :ref:`uproot.behaviors.TBranch.HasBranches.arrays`.
+            cut_extra_bytes (int): Only used by ``cut_mode="staged"``; a
+                non-negative number of extra compressed bytes (summed across all
+                output branches, per input step) that may be spent reading
+                payload ``TBaskets`` without surviving entries.
 
         Iterates through contiguous chunks of entries from the ``TTree``.
 
@@ -1369,9 +1459,13 @@ class HasBranches(Mapping):
                 library=library,
                 how=how,
                 report=report,
+                cut_mode=cut_mode,
+                cut_extra_bytes=cut_extra_bytes,
             )
 
         else:
+            cut_mode = _regularize_cut_mode(cut_mode)
+            cut_extra_bytes = _regularize_cut_extra_bytes(cut_extra_bytes)
             entry_start, entry_stop = _regularize_entries_start_stop(
                 self.tree.num_entries, entry_start, entry_stop
             )
@@ -1379,6 +1473,9 @@ class HasBranches(Mapping):
                 decompression_executor, interpretation_executor, self._file
             )
             library = uproot.interpretation.library._regularize_library(library)
+
+            if cut_mode == "staged" and cut is not None:
+                _staged_check_language_library(language, library)
 
             aliases = _regularize_aliases(self, aliases)
             (
@@ -1403,9 +1500,42 @@ class HasBranches(Mapping):
             )
 
             previous_baskets = {}
+            count_cache = {}
             for sub_entry_start in range(entry_start, entry_stop, entry_step):
                 sub_entry_stop = min(sub_entry_start + entry_step, entry_stop)
                 if sub_entry_stop - sub_entry_start == 0:
+                    continue
+
+                if cut_mode == "staged" and cut is not None:
+                    out, next_baskets = _staged_cut_arrays(
+                        self,
+                        {},
+                        expression_context,
+                        branchid_interpretation,
+                        sub_entry_start,
+                        sub_entry_stop,
+                        decompression_executor,
+                        interpretation_executor,
+                        library,
+                        keys,
+                        aliases,
+                        language,
+                        ak_add_doc,
+                        how,
+                        cut_extra_bytes,
+                        previous_baskets=previous_baskets,
+                        use_cache=False,
+                        count_cache=count_cache,
+                    )
+                    previous_baskets = next_baskets
+                    popper = [out]
+                    del out
+                    if report:
+                        yield popper.pop(), Report(
+                            self, sub_entry_start, sub_entry_stop
+                        )
+                    else:
+                        yield popper.pop()
                     continue
 
                 ranges_or_baskets = []
@@ -3348,6 +3478,702 @@ def _regularize_expressions(
 
 
 _basket_arrays_lock = threading.Lock()
+
+
+def _regularize_cut_mode(cut_mode):
+    if not isinstance(cut_mode, str) or cut_mode not in ("eager", "staged"):
+        raise ValueError(
+            f"cut_mode must be 'eager' or 'staged', not {cut_mode!r}"
+        )
+    return cut_mode
+
+
+def _regularize_cut_extra_bytes(cut_extra_bytes):
+    if not uproot._util.isint(cut_extra_bytes) or cut_extra_bytes < 0:
+        raise TypeError(
+            "cut_extra_bytes must be a non-negative integer "
+            f"(not bool), not {cut_extra_bytes!r}"
+        )
+    return int(cut_extra_bytes)
+
+
+def _staged_supported_interpretation(interpretation):
+    if isinstance(interpretation, uproot.interpretation.jagged.AsJagged):
+        return isinstance(
+            interpretation.content, uproot.interpretation.numerical.AsDtype
+        )
+    return isinstance(interpretation, uproot.interpretation.numerical.AsDtype)
+
+
+def _staged_check_language_library(language, library):
+    """
+    Refuses unsupported languages/libraries for staged ``cut`` reading,
+    before any expression analysis or ``TBasket`` request.
+    """
+    if not isinstance(language, uproot.language.python.PythonLanguage):
+        raise NotImplementedError(
+            "cut_mode='staged' is only implemented for "
+            f"uproot.language.python.PythonLanguage, not {language!r}"
+        )
+    if getattr(library, "name", None) != "ak":
+        raise NotImplementedError(
+            "cut_mode='staged' is only implemented for library='ak', "
+            f"not {getattr(library, 'name', library)!r}"
+        )
+
+
+def _staged_check(language, library, branchid_interpretation, out_keys, cut_keys):
+    """
+    Checks the staged-cut prerequisites *before* any data ``TBasket`` is
+    requested.
+    """
+    _staged_check_language_library(language, library)
+    checked = set()
+    for key in list(out_keys) + list(cut_keys):
+        if key in checked or key not in branchid_interpretation:
+            continue
+        checked.add(key)
+        interpretation = branchid_interpretation[key]
+        if not _staged_supported_interpretation(interpretation):
+            raise NotImplementedError(
+                "cut_mode='staged' currently supports only flat numerical, "
+                "fixed-length numerical, and one-level jagged numerical "
+                f"branches, not {interpretation!r}"
+            )
+
+
+def _staged_cut_mask(result, expected_length, hasbranches):
+    """
+    Converts the value of a cut expression into a one-dimensional boolean
+    NumPy array, rejecting per-element (jagged) masks.
+    """
+    awkward = uproot.extras.awkward()
+    if result is None:
+        return numpy.ones(expected_length, dtype=numpy.bool_)
+    if isinstance(result, awkward.Array):
+        if result.ndim != 1:
+            raise ValueError(
+                "cut_mode='staged' requires the cut to select whole events "
+                "(one boolean per event), but the cut produced a "
+                f"{result.ndim}-dimensional (jagged) mask for tree/branch "
+                f"{hasbranches.object_path} in file {hasbranches.file.file_path}"
+            )
+        result = awkward.to_numpy(result)
+    result = numpy.asarray(result)
+    if result.ndim != 1:
+        raise ValueError(
+            "cut_mode='staged' requires the cut to produce one boolean per "
+            f"event, but it produced shape {result.shape!r} for tree/branch "
+            f"{hasbranches.object_path} in file {hasbranches.file.file_path}"
+        )
+    if len(result) != expected_length:
+        raise ValueError(
+            "cut_mode='staged' requires the cut to produce one value per "
+            f"entry ({expected_length}), but it produced {len(result)} for "
+            f"tree/branch {hasbranches.object_path} in file "
+            f"{hasbranches.file.file_path}"
+        )
+    if result.dtype.kind not in "biuf":
+        raise TypeError(
+            "cut_mode='staged' requires a numeric or boolean cut, not "
+            f"{result.dtype!r} for tree/branch {hasbranches.object_path} "
+            f"in file {hasbranches.file.file_path}"
+        )
+    return numpy.asarray(result != 0, dtype=numpy.bool_)
+
+
+def _staged_full_range_read(
+    hasbranches,
+    keys,
+    expression_context,
+    branchid_interpretation,
+    entry_start,
+    entry_stop,
+    decompression_executor,
+    interpretation_executor,
+    library,
+    arrays,
+    previous_baskets,
+    interp_options,
+    array_cache=None,
+):
+    """
+    Reads all ``TBaskets`` (of the requested entry range) that the given
+    ``keys`` need, reusing ``previous_baskets`` where possible.
+
+    Returns the set of already-read baskets that extend beyond
+    ``entry_stop``, for reuse in a subsequent iteration window.
+    """
+    subset = {
+        key: branchid_interpretation[key]
+        for key in branchid_interpretation
+        if key in keys
+    }
+    target_arrays = {key: arrays[key] for key in subset if key in arrays}
+    ranges_or_baskets = []
+    checked = set()
+    for _, context in expression_context:
+        for branch in context["branches"]:
+            cache_key = branch.cache_key
+            if cache_key not in subset or cache_key in checked:
+                continue
+            checked.add(cache_key)
+            if cache_key in target_arrays:
+                # already available (from the array_cache)
+                continue
+            if isinstance(
+                branchid_interpretation[cache_key],
+                uproot.interpretation.grouped.AsGrouped,
+            ):
+                continue
+            for basket_num, range_or_basket in branch.entries_to_ranges_or_baskets(
+                entry_start, entry_stop
+            ):
+                previous = (
+                    None
+                    if previous_baskets is None
+                    else previous_baskets.get((cache_key, basket_num))
+                )
+                ranges_or_baskets.append(
+                    (
+                        branch,
+                        basket_num,
+                        range_or_basket if previous is None else previous,
+                    )
+                )
+
+    _ranges_or_baskets_to_arrays(
+        hasbranches,
+        ranges_or_baskets,
+        subset,
+        entry_start,
+        entry_stop,
+        decompression_executor,
+        interpretation_executor,
+        library,
+        target_arrays,
+        True,
+        interp_options,
+    )
+    arrays.update(target_arrays)
+
+    next_baskets = {}
+    for branch, basket_num, range_or_basket in ranges_or_baskets:
+        if (
+            isinstance(range_or_basket, uproot.models.TBasket.Model_TBasket)
+            and range_or_basket.entry_start_stop[1] > entry_stop
+        ):
+            next_baskets[(branch.cache_key, basket_num)] = range_or_basket
+    return next_baskets
+
+
+def _staged_counts_for_range(
+    hasbranches,
+    count_branch,
+    entry_start,
+    entry_stop,
+    count_cache,
+    previous_baskets,
+):
+    """
+    Produces the per-entry counts of ``count_branch`` for
+    ``[entry_start, entry_stop)`` by reading only the count ``TBaskets`` that
+    overlap that range. ``count_cache`` avoids re-reading count baskets and is
+    updated in place.
+    """
+    entry_offsets = count_branch.entry_offsets
+    cache_key = count_branch.cache_key
+    needed = []
+    for basket_num, basket_stop in enumerate(entry_offsets[1:]):
+        basket_start = entry_offsets[basket_num]
+        if basket_start < entry_stop and entry_start < basket_stop:
+            needed.append(basket_num)
+
+    to_read = [
+        basket_num
+        for basket_num in needed
+        if (cache_key, basket_num) not in count_cache
+    ]
+    if len(to_read) != 0:
+        baskets = _staged_read_baskets(
+            hasbranches, count_branch, to_read, previous_baskets
+        )
+        library = uproot.interpretation.library.NumPy()
+        context = dict(count_branch.context)
+        for basket_num in to_read:
+            basket = baskets[basket_num]
+            array = count_branch.interpretation.basket_array(
+                basket.data,
+                basket.byte_offsets,
+                basket,
+                count_branch,
+                context,
+                basket.member("fKeylen"),
+                library,
+                {},
+            )
+            count_cache[(cache_key, basket_num)] = numpy.asarray(array)
+    pieces = []
+    for basket_num in needed:
+        basket_start = entry_offsets[basket_num]
+        basket_stop = entry_offsets[basket_num + 1]
+        counts = count_cache[(cache_key, basket_num)]
+        lo = max(entry_start, basket_start) - basket_start
+        hi = min(entry_stop, basket_stop) - basket_start
+        pieces.append(counts[lo:hi])
+    if len(pieces) == 0:
+        return numpy.empty(0, dtype=numpy.int32)
+    return numpy.concatenate(pieces)
+
+
+def _staged_basket_infos(branch, entry_start, entry_stop, survivors):
+    """
+    Returns a list of dicts describing every ``TBasket`` of ``branch`` that
+    overlaps ``[entry_start, entry_stop)``, including whether it contains a
+    surviving entry.
+    """
+    entry_offsets = branch.entry_offsets
+    out = []
+    for basket_num, basket_stop in enumerate(entry_offsets[1:]):
+        basket_start = entry_offsets[basket_num]
+        if basket_start < entry_stop and entry_start < basket_stop:
+            lo = numpy.searchsorted(
+                survivors, max(basket_start, entry_start), side="left"
+            )
+            hi = numpy.searchsorted(
+                survivors, min(basket_stop, entry_stop), side="left"
+            )
+            out.append(
+                {
+                    "basket_num": basket_num,
+                    "basket_start": int(basket_start),
+                    "basket_stop": int(basket_stop),
+                    "required": bool(hi > lo),
+                    "bytes": int(branch.basket_compressed_bytes(basket_num)),
+                }
+            )
+    return out
+
+
+def _staged_plan_optional_baskets(infos, density_threshold=0.5):
+    """
+    Chooses which non-required ``TBaskets`` (gaps between surviving hits) are
+    worth reading, in priority order.
+
+    Dense selections fill gaps in entry order (fewer, larger request
+    schedules); sparse selections only consider baskets nearest to a hit.
+    """
+    required = [info for info in infos if info["required"]]
+    optional = [info for info in infos if not info["required"]]
+    if len(required) == 0 or len(optional) == 0:
+        return []
+    first = min(info["basket_num"] for info in required)
+    last = max(info["basket_num"] for info in required)
+    optional = [
+        info for info in optional if first < info["basket_num"] < last
+    ]
+    density = len(required) / float(len(infos))
+    if density >= density_threshold:
+        optional.sort(key=lambda info: info["basket_num"])
+    else:
+        required_nums = [info["basket_num"] for info in required]
+        optional.sort(
+            key=lambda info: min(
+                abs(info["basket_num"] - number) for number in required_nums
+            )
+        )
+    return optional
+
+
+def _staged_read_baskets(
+    hasbranches, branch, basket_nums, previous_baskets
+):
+    """
+    Obtains ``Model_TBasket`` objects for ``basket_nums``, reusing
+    ``previous_baskets`` and batching all new byte-range requests.
+    """
+    file = hasbranches._file
+    baskets = {}
+    ranges = []
+    range_keys = []
+    for basket_num in basket_nums:
+        previous = (
+            None
+            if previous_baskets is None
+            else previous_baskets.get((branch.cache_key, basket_num))
+        )
+        if previous is not None:
+            baskets[basket_num] = previous
+            continue
+        if 0 <= basket_num < branch._num_normal_baskets:
+            byte_start = int(branch.member("fBasketSeek")[basket_num])
+            byte_stop = byte_start + branch.basket_compressed_bytes(basket_num)
+            ranges.append((byte_start, byte_stop))
+            range_keys.append(basket_num)
+        else:
+            baskets[basket_num] = branch.basket(basket_num)
+    if len(ranges) != 0:
+        notifications = queue.Queue()
+        chunks = file.source.chunks(ranges, notifications=notifications)
+        for basket_num, chunk in zip(range_keys, chunks):
+            cursor = uproot.source.cursor.Cursor(chunk.start)
+            baskets[basket_num] = uproot.models.TBasket.Model_TBasket.read(
+                chunk, cursor, {"basket_num": basket_num}, file, file, branch
+            )
+    return baskets
+
+
+def _staged_events_from_basket(
+    interpretation, basket_array, basket_start, survivor_locals
+):
+    """
+    Extracts the surviving entries (by local index) from a temporary array
+    produced from one ``TBasket``.
+    """
+    if isinstance(interpretation, uproot.interpretation.jagged.AsJagged):
+        offsets = basket_array.offsets
+        content = basket_array.content
+        counts = offsets[survivor_locals + 1] - offsets[survivor_locals]
+        new_offsets = numpy.empty(len(survivor_locals) + 1, dtype=numpy.int64)
+        new_offsets[0] = 0
+        numpy.cumsum(counts, out=new_offsets[1:])
+        if len(survivor_locals) == 0:
+            return uproot.interpretation.jagged.JaggedArray(
+                new_offsets, content[:0]
+            )
+        pieces = [
+            content[offsets[index] : offsets[index + 1]]
+            for index in survivor_locals
+        ]
+        return uproot.interpretation.jagged.JaggedArray(
+            new_offsets, numpy.concatenate(pieces)
+        )
+    else:
+        return basket_array[survivor_locals]
+
+
+def _staged_read_output_branch(
+    hasbranches,
+    branch,
+    interpretation,
+    entry_start,
+    entry_stop,
+    survivors,
+    library,
+    previous_baskets,
+    extra_basket_nums,
+    interp_options,
+    count_cache=None,
+):
+    """
+    Reads only the ``TBaskets`` needed to produce the surviving entries of an
+    output branch and assembles them, in event order, into a temporary array.
+
+    Returns ``(array, next_baskets)``.
+    """
+    infos = _staged_basket_infos(branch, entry_start, entry_stop, survivors)
+    required = [info for info in infos if info["required"]]
+    next_baskets = {}
+
+    # Anything already read for this branch that extends past this window stays
+    # available for the next window, even if this window needs no new reads.
+    if previous_baskets is not None:
+        for key, basket in previous_baskets.items():
+            if key[0] == branch.cache_key and basket.entry_start_stop[1] > entry_stop:
+                next_baskets[key] = basket
+
+    if len(required) == 0:
+        empty = interpretation.final_array(
+            {}, 0, 0, [0, 0], library, branch, interp_options
+        )
+        return empty, next_baskets
+
+    basket_nums = [info["basket_num"] for info in required] + list(
+        extra_basket_nums
+    )
+    baskets = _staged_read_baskets(
+        hasbranches, branch, sorted(set(basket_nums)), previous_baskets
+    )
+
+    for basket_num, basket in baskets.items():
+        if basket.entry_start_stop[1] > entry_stop:
+            next_baskets[(branch.cache_key, basket_num)] = basket
+
+    pieces = []
+    for info in required:
+        basket_num = info["basket_num"]
+        basket = baskets[basket_num]
+        basket_start, basket_stop = basket.entry_start_stop
+
+        if (
+            isinstance(interpretation, uproot.interpretation.jagged.AsJagged)
+            and basket.byte_offsets is None
+            and branch.count_branch is not None
+        ):
+            basket._staged_counts = _staged_counts_for_range(
+                hasbranches,
+                branch.count_branch,
+                int(basket_start),
+                int(basket_stop),
+                count_cache if count_cache is not None else {},
+                previous_baskets,
+            )
+
+        context = dict(branch.context)
+        basket_array = interpretation.basket_array(
+            basket.data,
+            basket.byte_offsets,
+            basket,
+            branch,
+            context,
+            basket.member("fKeylen"),
+            library,
+            interp_options,
+        )
+
+        lo = numpy.searchsorted(
+            survivors, max(int(basket_start), entry_start), side="left"
+        )
+        hi = numpy.searchsorted(
+            survivors, min(int(basket_stop), entry_stop), side="left"
+        )
+        survivor_locals = survivors[lo:hi] - int(basket_start)
+        pieces.append(
+            _staged_events_from_basket(
+                interpretation, basket_array, basket_start, survivor_locals
+            )
+        )
+
+    if len(pieces) == 0:
+        empty = interpretation.final_array(
+            {}, 0, 0, [0, 0], library, branch, interp_options
+        )
+        return empty, next_baskets
+
+    if isinstance(interpretation, uproot.interpretation.jagged.AsJagged):
+        lengths = numpy.array(
+            [int(piece.offsets[-1]) for piece in pieces], dtype=numpy.int64
+        )
+        before = numpy.zeros(len(pieces) + 1, dtype=numpy.int64)
+        numpy.cumsum(lengths, out=before[1:])
+        total = int(before[-1])
+        offsets = numpy.empty(
+            sum(len(piece.offsets) - 1 for piece in pieces) + 1, dtype=numpy.int64
+        )
+        position = 0
+        pieces_content = []
+        for i, piece in enumerate(pieces):
+            part = piece.offsets
+            offsets[position : position + len(part)] = part + before[i]
+            position += len(part) - 1
+            pieces_content.append(piece.content)
+        offsets[-1] = total
+
+        content = numpy.empty((total,), interpretation.content.to_dtype)
+        position = 0
+        for piece_content in pieces_content:
+            content[position : position + len(piece_content)] = piece_content
+            position += len(piece_content)
+        output = uproot.interpretation.jagged.JaggedArray(offsets, content)
+    else:
+        total = int(sum(len(piece) for piece in pieces))
+        output = numpy.empty((total,), interpretation.to_dtype)
+        position = 0
+        for piece in pieces:
+            output[position : position + len(piece)] = piece
+            position += len(piece)
+
+    output = library.finalize(
+        output, branch, interpretation, entry_start, entry_stop, interp_options
+    )
+    return output, next_baskets
+
+
+def _staged_cut_arrays(
+    hasbranches,
+    arrays,
+    expression_context,
+    branchid_interpretation,
+    entry_start,
+    entry_stop,
+    decompression_executor,
+    interpretation_executor,
+    library,
+    keys,
+    aliases,
+    language,
+    ak_add_doc,
+    how,
+    cut_extra_bytes,
+    previous_baskets=None,
+    use_cache=True,
+    count_cache=None,
+):
+    """
+    The staged-cut implementation: read only the branches needed to evaluate
+    ``cut``, evaluate it, and then read only the payload ``TBaskets`` that
+    contain surviving entries (plus as many extra ``TBaskets`` as
+    ``cut_extra_bytes`` permits).
+
+    Returns ``(grouped_output, next_baskets)``.
+    """
+    if count_cache is None:
+        count_cache = {}
+    interp_options = {"ak_add_doc": ak_add_doc}
+
+    cut_keys = set()
+    out_keys = set()
+    branch_by_key = {}
+    for _, context in expression_context:
+        for branch in context["branches"]:
+            branch_by_key.setdefault(branch.cache_key, branch)
+        if context["is_cut"]:
+            for branch in context["branches"]:
+                cut_keys.add(branch.cache_key)
+        elif context["is_primary"]:
+            for branch in context["branches"]:
+                out_keys.add(branch.cache_key)
+
+    # Refuse unsupported language/library/interpretations before any basket I/O.
+    _staged_check(language, library, branchid_interpretation, out_keys, cut_keys)
+
+    # Stage 1: only the branches the cut needs, over the whole entry range.
+    cached_inputs = arrays if use_cache else {}
+    cut_arrays = {key: cached_inputs[key] for key in cut_keys if key in cached_inputs}
+    next_baskets = _staged_full_range_read(
+        hasbranches,
+        cut_keys,
+        expression_context,
+        branchid_interpretation,
+        entry_start,
+        entry_stop,
+        decompression_executor,
+        interpretation_executor,
+        library,
+        cut_arrays,
+        previous_baskets,
+        interp_options,
+    )
+
+    cut_context = [
+        (expression, context)
+        for expression, context in expression_context
+        if context["is_cut"]
+    ]
+    cut_result = language.compute_cut(
+        hasbranches,
+        cut_arrays,
+        cut_context,
+        keys,
+        aliases,
+        hasbranches.file.file_path,
+        hasbranches.object_path,
+    )
+    mask = _staged_cut_mask(cut_result, entry_stop - entry_start, hasbranches)
+    survivors = numpy.nonzero(mask)[0].astype(numpy.int64) + entry_start
+
+    # Stage 2: payloads for surviving entries only.
+    remaining = int(cut_extra_bytes)
+
+    # Arrays that came from the array cache are at full range; note them so
+    # that they can be filtered down to the surviving entries.
+    cached_out_keys = set()
+    if use_cache:
+        cached_out_keys = {
+            key for key in out_keys if key in arrays and key not in cut_keys
+        }
+
+    # Output branches that are also cut dependencies: their full-range arrays
+    # were read in stage 1, so just filter the survivors out of them.
+    for key in sorted(out_keys):
+        if key in cut_keys:
+            full = cut_arrays.get(key)
+            if full is not None:
+                if len(survivors) == 0:
+                    arrays[key] = full[:0]
+                else:
+                    arrays[key] = full[survivors - entry_start]
+
+    # Cached full-range output arrays are filtered in place.
+    for key in sorted(cached_out_keys):
+        cached = arrays[key]
+        if len(survivors) == 0:
+            arrays[key] = cached[:0]
+        else:
+            arrays[key] = cached[survivors - entry_start]
+
+    read_keys = [
+        key
+        for key in out_keys
+        if key not in arrays
+        and key not in cut_keys
+        and key in branchid_interpretation
+    ]
+
+    # Plan required and optional baskets for all output-only branches with a
+    # single, shared budget.
+    plan = {}
+    optional_candidates = []
+    for key in read_keys:
+        branch = branch_by_key.get(key)
+        infos = _staged_basket_infos(branch, entry_start, entry_stop, survivors)
+        plan[key] = {"branch": branch, "required": [], "extra": []}
+        for info in infos:
+            if info["required"]:
+                plan[key]["required"].append(info["basket_num"])
+        for rank, info in enumerate(_staged_plan_optional_baskets(infos)):
+            optional_candidates.append((rank, key, info))
+    optional_candidates.sort(key=lambda item: (item[0], item[1]))
+
+    for _, key, info in optional_candidates:
+        if remaining < info["bytes"]:
+            continue
+        remaining -= info["bytes"]
+        plan[key]["extra"].append(info["basket_num"])
+
+    for key in read_keys:
+        item = plan[key]
+        output, reuse = _staged_read_output_branch(
+            hasbranches,
+            item["branch"],
+            branchid_interpretation[key],
+            entry_start,
+            entry_stop,
+            survivors,
+            library,
+            previous_baskets,
+            item["extra"],
+            interp_options,
+            count_cache,
+        )
+        arrays[key] = output
+        next_baskets.update(reuse)
+
+    output = language.compute_expressions(
+        hasbranches,
+        arrays,
+        expression_context,
+        keys,
+        aliases,
+        hasbranches.file.file_path,
+        hasbranches.object_path,
+        cut_already_applied=True,
+    )
+
+    minimized_expression_context = [
+        (expression, context)
+        for expression, context in expression_context
+        if context["is_primary"] and not context["is_cut"]
+    ]
+
+    return (
+        _ak_add_doc(
+            library.group(output, minimized_expression_context, how),
+            hasbranches,
+            ak_add_doc,
+        ),
+        next_baskets,
+    )
 
 
 def _ranges_or_baskets_to_arrays(
