@@ -11,6 +11,7 @@ context manager (Python's ``with`` statement) to ensure that files are properly 
 
 from __future__ import annotations
 
+import io
 import numbers
 import os
 from typing import IO
@@ -36,6 +37,15 @@ class FileSink:
     def __init__(self, urlpath_or_file_like: str | IO, **storage_options):
         self._open_file = None
         self._file = None
+        # A transaction is a set of byte-range backups taken before every
+        # write/flush inside one logical operation (e.g. WritableTree.extend).
+        # While ``_transaction`` is not None and the storage can be read back,
+        # the first write touching a byte range saves its previous contents so
+        # that the operation can be rolled back to its pre-transaction state.
+        # Write-only streams cannot be backed up; on those, only the in-memory
+        # state rollback is available (the historical behavior).
+        self._transaction = None
+        self._backup_supported = None
 
         if uproot._util.is_file_like(
             urlpath_or_file_like, readable=False, writable=False, seekable=False
@@ -123,9 +133,189 @@ class FileSink:
     def flush(self) -> None:
         """
         Calls the file or file-like object's ``flush`` method.
+
+        A flush does not modify file bytes; a flush failure inside a
+        transaction propagates to the caller, which can roll the transaction
+        back.
         """
         self._ensure()
         return self._file.flush()
+
+    def begin_transaction(self) -> None:
+        """
+        Begin a logical write transaction.
+
+        Until :ref:`uproot.sink.file.FileSink.commit_transaction` or
+        :ref:`uproot.sink.file.FileSink.rollback_transaction` is called, the
+        original bytes of every overwritten range are retained whenever the
+        underlying storage is readable, and all writes are verified to cover
+        the full requested length (short writes and zero-progress writes raise
+        ``OSError`` instead of silently truncating the data).
+        """
+        if self._transaction is not None:
+            raise RuntimeError("a write transaction is already in progress")
+        self._transaction = []
+        if self._backup_supported is None:
+            self._backup_supported = self._probe_backup_support()
+
+    def commit_transaction(self) -> None:
+        """
+        Discard the backups accumulated since
+        :ref:`uproot.sink.file.FileSink.begin_transaction`, making the writes
+        permanent.
+
+        The data are flushed first; if the flush fails, the transaction stays
+        open so that the caller can roll it back.
+        """
+        if self._transaction is None:
+            raise RuntimeError("no write transaction is in progress")
+        self.flush()
+        self._transaction = None
+
+    def rollback_transaction(self) -> None:
+        """
+        Restore every byte range recorded since
+        :ref:`uproot.sink.file.FileSink.begin_transaction` to its
+        pre-transaction contents, when the storage is readable.
+
+        Restores happen in reverse order (backed-up ranges are disjoint, so
+        order does not matter for correctness) and are themselves full-length
+        writes. Write-only streams cannot be restored byte-for-byte; on those
+        the transaction is simply closed, leaving the in-memory state rollback
+        (handled by the caller) as the recovery mechanism. A failure while
+        restoring propagates to the caller: the original failure that
+        triggered the rollback is the one guaranteed to be recoverable when
+        the storage layer is healthy again, which is the assumed scenario
+        after a one-shot injected fault.
+        """
+        if self._transaction is None:
+            raise RuntimeError("no write transaction is in progress")
+        backups = self._transaction
+        try:
+            if self._backup_supported:
+                for start, _stop, original in reversed(backups):
+                    if len(original) > 0:
+                        self._write_full(start, original, backup=False)
+                self.flush()
+        finally:
+            self._transaction = None
+
+    def _probe_backup_support(self) -> bool:
+        """Whether existing bytes can be read back before overwriting them."""
+        try:
+            self._ensure()
+            if hasattr(self._file, "readable") and not self._file.readable():
+                return False
+            if hasattr(self._file, "seekable") and not self._file.seekable():
+                return False
+            position = self._file.tell()
+            self._file.seek(0)
+            self._file.read(0)
+            self._file.seek(position)
+        except (OSError, io.UnsupportedOperation, ValueError):
+            return False
+        return True
+
+    def _backup_range(self, location: int, num_bytes: int) -> None:
+        """Extend the transaction backup to cover [location, location + num_bytes)."""
+        transaction = self._transaction
+        if num_bytes <= 0 or transaction is None or not self._backup_supported:
+            return
+        stop = location + num_bytes
+
+        # Find every existing interval overlapping the new range. Backed-up
+        # intervals are always disjoint and sorted by start position.
+        overlapping = [
+            i
+            for i, (i_start, i_stop, _) in enumerate(transaction)
+            if i_start < stop and location < i_stop
+        ]
+        if not overlapping:
+            insert_at = 0
+            while insert_at < len(transaction) and transaction[insert_at][0] < location:
+                insert_at += 1
+            transaction.insert(
+                insert_at, (location, stop, self._read_at(location, num_bytes))
+            )
+            return
+
+        left, right = overlapping[0], overlapping[-1] + 1
+        merged_start = min(location, transaction[left][0])
+        merged_stop = max(stop, transaction[right - 1][1])
+
+        # Rebuild the original bytes of the whole union: stored backups cover
+        # previously seen regions; any gaps are read fresh.
+        pieces = []
+        cursor = merged_start
+        for i_start, i_stop, i_bytes in transaction[left:right]:
+            if cursor < i_start:
+                pieces.append(self._read_at(cursor, i_start - cursor))
+            pieces.append(i_bytes)
+            cursor = i_stop
+        if cursor < merged_stop:
+            pieces.append(self._read_at(cursor, merged_stop - cursor))
+        transaction[left:right] = [(merged_start, merged_stop, b"".join(pieces))]
+
+    def _read_at(self, location: int, num_bytes: int) -> bytes:
+        """Read existing bytes without insisting past end-of-file."""
+        self._ensure()
+        self._file.seek(location)
+        out = self._file.read(num_bytes)
+        if len(out) < num_bytes:
+            # The region extends past the current end of the file; those bytes
+            # are logically zero until written.
+            out = out + b"\x00" * (num_bytes - len(out))
+        return out
+
+    def _write_full(self, location: int, serialization, *, backup: bool = True):
+        """Seek to ``location`` and write every byte of ``serialization``.
+
+        Raises ``OSError`` if the underlying object reports a short write or
+        zero progress, rather than leaving a truncated basket or metadata
+        record on disk.
+        """
+        self._ensure()
+        if hasattr(serialization, "tobytes"):
+            data = serialization.tobytes()
+        else:
+            data = bytes(serialization)
+        num_bytes = len(data)
+        if backup:
+            self._backup_range(location, num_bytes)
+        self._file.seek(location)
+        view = memoryview(data)
+        while view:
+            written = self._file.write(view)
+            if written is None:
+                # Some text-like objects return None; treat a missing count as
+                # an error rather than risking an infinite loop.
+                raise OSError(
+                    "underlying write() did not report the number of bytes "
+                    f"written at position {location}{self.in_path}"
+                )
+            if not isinstance(written, numbers.Integral) or written < 0:
+                raise OSError(
+                    f"underlying write() returned an invalid byte count {written!r} "
+                    f"at position {location}{self.in_path}"
+                )
+            if written == 0:
+                raise OSError(
+                    "underlying write() made no progress (returned 0) at "
+                    f"position {location}{self.in_path}"
+                )
+            if written > len(view):
+                raise OSError(
+                    f"underlying write() claimed {written} bytes but only "
+                    f"{len(view)} were requested at position {location}{self.in_path}"
+                )
+            view = view[written:]
+            if view:
+                # A short write may have left the file position anywhere
+                # (typically partway through the request). Re-seek relative
+                # to the *original* location each time so retries never stack
+                # on top of whatever position the object ended at.
+                self._file.seek(location + num_bytes - len(view))
+        return num_bytes
 
     @property
     def closed(self) -> bool:
@@ -160,24 +350,26 @@ class FileSink:
             location (int): Position in the file to write.
             serialization (bytes or NumPy array): Data to write to the file.
 
-        Writes data to the file at a specific location, calling the file-like
-        object's ``seek`` and ``write`` methods.
+        Writes data to the file at a specific location. All requested bytes are
+        written: a short write or zero-progress write is retried until complete
+        or raises ``OSError`` rather than leaving truncated data. Inside a
+        transaction (see :ref:`uproot.sink.file.FileSink.begin_transaction`),
+        the previous contents of any overwritten range are retained for
+        rollback.
         """
-        self._ensure()
-        self._file.seek(location)
-        return self._file.write(serialization)
+        return self._write_full(location, serialization, backup=True)
 
     def set_file_length(self, length: int):
         """
         Sets the file's length to ``length``, truncating with zeros if necessary.
 
-        Calls ``seek``, ``tell``, and possibly ``write``.
+        Calls ``seek``, ``tell``, and possibly a full-length write.
         """
         self._ensure()
         self._file.seek(0, os.SEEK_END)
         missing = length - self._file.tell()
         if missing > 0:
-            self._file.write(b"\x00" * missing)
+            self._write_full(length - missing, b"\x00" * missing)
 
     def read(self, location: int, num_bytes: int, insist: bool = True) -> bytes:
         """

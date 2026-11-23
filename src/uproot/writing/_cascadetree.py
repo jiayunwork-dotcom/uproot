@@ -455,49 +455,9 @@ class Tree:
         return self._num_baskets
 
     def extend(self, file, sink, data):
-        # expand capacity if this would REACH (not EXCEED) the existing capacity
-        # that's because completely a full fBasketEntry has nowhere to put the
-        # number of entries in the last basket (it's a fencepost principle thing),
-        # forcing ROOT and Uproot to look it up from the basket header.
-        if self._num_baskets >= self._basket_capacity - 1:
-            self._basket_capacity = max(
-                self._basket_capacity + 1,
-                math.ceil(self._basket_capacity * self._resize_factor),
-            )
-
-            for datum in self._branch_data:
-                if datum["kind"] == "record":
-                    continue
-
-                fBasketBytes = datum["fBasketBytes"]
-                fBasketEntry = datum["fBasketEntry"]
-                fBasketSeek = datum["fBasketSeek"]
-                datum["fBasketBytes"] = numpy.zeros(
-                    self._basket_capacity, uproot.models.TBranch._tbranch13_dtype1
-                )
-                datum["fBasketEntry"] = numpy.zeros(
-                    self._basket_capacity, uproot.models.TBranch._tbranch13_dtype2
-                )
-                datum["fBasketSeek"] = numpy.zeros(
-                    self._basket_capacity, uproot.models.TBranch._tbranch13_dtype3
-                )
-                datum["fBasketBytes"][: len(fBasketBytes)] = fBasketBytes
-                datum["fBasketEntry"][: len(fBasketEntry)] = fBasketEntry
-                datum["fBasketSeek"][: len(fBasketSeek)] = fBasketSeek
-                datum["fBasketEntry"][len(fBasketEntry)] = self._num_entries
-
-            oldloc = start = self._key.location
-            stop = start + self._key.num_bytes + self._key.compressed_bytes
-
-            self.write_anew(sink)
-
-            newloc = self._key.seek_location
-            file._move_tree(oldloc, newloc)
-
-            self._freesegments.release(start, stop)
-            sink.set_file_length(self._freesegments.fileheader.end)
-            sink.flush()
-
+        # Everything before the snapshot below is input handling and
+        # validation: no file I/O and no committed tree state may change, so a
+        # validation failure cannot advance the batch boundary.
         provided = None
 
         if uproot._util.from_module(data, "pandas"):
@@ -735,10 +695,6 @@ class Tree:
                             )
                         )
                     tofill.append((branch_name, datum["compression"], big_endian, None))
-                    if datum["kind"] == "counter" and big_endian.size > 0:
-                        datum["tleaf_maximum_value"] = max(
-                            big_endian.max(), datum["tleaf_maximum_value"]
-                        )
 
             else:
                 try:
@@ -807,6 +763,73 @@ class Tree:
                     )
                 )
 
+        # An empty batch adds no basket and must not move the commit boundary:
+        # no allocation, no metadata update, no flush.
+        if num_entries == 0:
+            return
+
+        # From here on, every effect must be all-or-nothing. The in-memory
+        # snapshot restores tree/branch/FreeSegments/directory state, while the
+        # sink transaction restores overwritten bytes, including partial writes
+        # that already reached the storage layer.
+        snapshot = self._snapshot_state(file)
+        sink.begin_transaction()
+        try:
+            self._extend_locked(file, sink, tofill, num_entries)
+            sink.commit_transaction()
+        except BaseException:
+            try:
+                sink.rollback_transaction()
+            finally:
+                # Always put the in-memory structures back, even if the
+                # on-disk restore itself encountered another error.
+                self._restore_state(file, snapshot)
+            raise
+
+    def _extend_locked(self, file, sink, tofill, num_entries):
+        # expand capacity if this would REACH (not EXCEED) the existing capacity
+        # that's because completely a full fBasketEntry has nowhere to put the
+        # number of entries in the last basket (it's a fencepost principle thing),
+        # forcing ROOT and Uproot to look it up from the basket header.
+        if self._num_baskets >= self._basket_capacity - 1:
+            self._basket_capacity = max(
+                self._basket_capacity + 1,
+                math.ceil(self._basket_capacity * self._resize_factor),
+            )
+
+            for datum in self._branch_data:
+                if datum["kind"] == "record":
+                    continue
+
+                fBasketBytes = datum["fBasketBytes"]
+                fBasketEntry = datum["fBasketEntry"]
+                fBasketSeek = datum["fBasketSeek"]
+                datum["fBasketBytes"] = numpy.zeros(
+                    self._basket_capacity, uproot.models.TBranch._tbranch13_dtype1
+                )
+                datum["fBasketEntry"] = numpy.zeros(
+                    self._basket_capacity, uproot.models.TBranch._tbranch13_dtype2
+                )
+                datum["fBasketSeek"] = numpy.zeros(
+                    self._basket_capacity, uproot.models.TBranch._tbranch13_dtype3
+                )
+                datum["fBasketBytes"][: len(fBasketBytes)] = fBasketBytes
+                datum["fBasketEntry"][: len(fBasketEntry)] = fBasketEntry
+                datum["fBasketSeek"][: len(fBasketSeek)] = fBasketSeek
+                datum["fBasketEntry"][len(fBasketEntry)] = self._num_entries
+
+            oldloc = start = self._key.location
+            stop = start + self._key.num_bytes + self._key.compressed_bytes
+
+            self.write_anew(sink)
+
+            newloc = self._key.seek_location
+            file._move_tree(oldloc, newloc)
+
+            self._freesegments.release(start, stop)
+            sink.set_file_length(self._freesegments.fileheader.end)
+            sink.flush()
+
         # actually write baskets into the file
         uncompressed_bytes = 0
         compressed_bytes = 0
@@ -845,6 +868,11 @@ class Tree:
 
             datum["arrays_write_stop"] = self._num_baskets + 1
 
+            if datum["kind"] == "counter" and big_endian.size > 0:
+                datum["tleaf_maximum_value"] = max(
+                    big_endian.max(), datum["tleaf_maximum_value"]
+                )
+
         # update TTree metadata in file
         self._num_entries += num_entries
         self._num_baskets += 1
@@ -852,6 +880,224 @@ class Tree:
         self._metadata["fZipBytes"] += compressed_bytes
 
         self.write_updates(sink)
+
+    def _snapshot_state(self, file):
+        """Capture every mutable in-memory state touched by one extend call."""
+        branch_snapshots = []
+        for datum in self._branch_data:
+            branch_snapshots.append(
+                {
+                    "fBasketBytes": datum["fBasketBytes"].copy(),
+                    "fBasketEntry": datum["fBasketEntry"].copy(),
+                    "fBasketSeek": datum["fBasketSeek"].copy(),
+                    "fTotBytes": datum["fTotBytes"],
+                    "fZipBytes": datum["fZipBytes"],
+                    "fEntryOffsetLen": datum["fEntryOffsetLen"],
+                    "arrays_write_start": datum["arrays_write_start"],
+                    "arrays_write_stop": datum["arrays_write_stop"],
+                    "tleaf_maximum_value": datum["tleaf_maximum_value"],
+                    "metadata_start": datum["metadata_start"],
+                    "basket_metadata_start": datum["basket_metadata_start"],
+                    "tleaf_reference_number": datum["tleaf_reference_number"],
+                    "tleaf_special_struct": datum["tleaf_special_struct"],
+                }
+            )
+
+        freesegments = self._freesegments
+        fs_snapshot = {
+            "key": freesegments._key,
+            "key_location": freesegments._key._location,
+            "key_seek_location": freesegments._key._seek_location,
+            "key_uncompressed_bytes": freesegments._key._uncompressed_bytes,
+            "key_compressed_bytes": freesegments._key._compressed_bytes,
+            "key_file_dirty": freesegments._key._file_dirty,
+            "data": freesegments._data,
+            "data_location": freesegments._data._location,
+            "data_slices": freesegments._data._slices,
+            "data_end": freesegments._data._end,
+            "data_allocation": freesegments._data._allocation,
+            "data_file_dirty": freesegments._data._file_dirty,
+            "fileheader": freesegments._fileheader,
+            "fileheader_end": freesegments._fileheader._end,
+            "fileheader_free_location": freesegments._fileheader._free_location,
+            "fileheader_free_num_bytes": freesegments._fileheader._free_num_bytes,
+            "fileheader_free_num_slices": freesegments._fileheader._free_num_slices,
+            "fileheader_info_location": freesegments._fileheader._info_location,
+            "fileheader_info_num_bytes": freesegments._fileheader._info_num_bytes,
+            "fileheader_begin_num_bytes": freesegments._fileheader._begin_num_bytes,
+            "fileheader_file_dirty": freesegments._fileheader._file_dirty,
+        }
+
+        directory = self._directory
+        directory_data = directory._data
+        datakey = directory._datakey
+        directory_key = directory._key
+        directory_snapshot = {
+            "directory": directory,
+            "directory_key": directory_key,
+            "directory_key_location": directory_key._location,
+            "directory_key_seek_location": directory_key._seek_location,
+            "directory_key_uncompressed_bytes": directory_key._uncompressed_bytes,
+            "directory_key_compressed_bytes": directory_key._compressed_bytes,
+            "directory_key_file_dirty": directory_key._file_dirty,
+            "name_location": getattr(directory, "_name", None)
+            and directory._name._location,
+            "title_location": getattr(directory, "_title", None)
+            and directory._title._location,
+            "datakey": datakey,
+            "datakey_location": datakey._location,
+            "datakey_seek_location": datakey._seek_location,
+            "datakey_uncompressed_bytes": datakey._uncompressed_bytes,
+            "datakey_compressed_bytes": datakey._compressed_bytes,
+            "datakey_file_dirty": datakey._file_dirty,
+            "data": directory_data,
+            "data_location": directory_data._location,
+            "data_allocation": directory_data._allocation,
+            "data_file_dirty": directory_data._file_dirty,
+            "data_dirty_keys": list(directory_data._dirty_keys),
+            "data_dirty_keys_start": directory_data._dirty_keys_start,
+            "data_keys_num_bytes": directory_data._keys_num_bytes,
+            "data_keys": list(directory_data._keys),
+            "data_keys_by_name": {
+                name: list(keys)
+                for name, keys in directory_data._keys_by_name.items()
+            },
+            "header": directory._header,
+            "header_location": directory._header._location,
+            "header_begin_location": directory._header._begin_location,
+            "header_begin_num_bytes": directory._header._begin_num_bytes,
+            "header_data_location": directory._header._data_location,
+            "header_data_num_bytes": directory._header._data_num_bytes,
+            "header_modified_on": directory._header._modified_on,
+            "header_file_dirty": directory._header._file_dirty,
+        }
+
+        return {
+            "num_entries": self._num_entries,
+            "num_baskets": self._num_baskets,
+            "basket_capacity": self._basket_capacity,
+            "metadata": dict(self._metadata),
+            "key": self._key,
+            "metadata_start": self._metadata_start,
+            "branches": branch_snapshots,
+            "freesegments": fs_snapshot,
+            "directory": directory_snapshot,
+            "file_trees": dict(file._trees),
+        }
+
+    def _restore_state(self, file, snapshot):
+        """Put every in-memory structure back to its pre-extend state."""
+        self._num_entries = snapshot["num_entries"]
+        self._num_baskets = snapshot["num_baskets"]
+        self._basket_capacity = snapshot["basket_capacity"]
+        self._metadata = snapshot["metadata"]
+        self._key = snapshot["key"]
+        self._metadata_start = snapshot["metadata_start"]
+
+        for datum, branch_snapshot in zip(self._branch_data, snapshot["branches"]):
+            datum["fBasketBytes"] = branch_snapshot["fBasketBytes"]
+            datum["fBasketEntry"] = branch_snapshot["fBasketEntry"]
+            datum["fBasketSeek"] = branch_snapshot["fBasketSeek"]
+            datum["fTotBytes"] = branch_snapshot["fTotBytes"]
+            datum["fZipBytes"] = branch_snapshot["fZipBytes"]
+            datum["fEntryOffsetLen"] = branch_snapshot["fEntryOffsetLen"]
+            datum["arrays_write_start"] = branch_snapshot["arrays_write_start"]
+            datum["arrays_write_stop"] = branch_snapshot["arrays_write_stop"]
+            datum["tleaf_maximum_value"] = branch_snapshot["tleaf_maximum_value"]
+            datum["metadata_start"] = branch_snapshot["metadata_start"]
+            datum["basket_metadata_start"] = branch_snapshot["basket_metadata_start"]
+            datum["tleaf_reference_number"] = branch_snapshot[
+                "tleaf_reference_number"
+            ]
+            datum["tleaf_special_struct"] = branch_snapshot["tleaf_special_struct"]
+
+        fs_snapshot = snapshot["freesegments"]
+        fs_key = fs_snapshot["key"]
+        fs_key._location = fs_snapshot["key_location"]
+        fs_key._seek_location = fs_snapshot["key_seek_location"]
+        fs_key._uncompressed_bytes = fs_snapshot["key_uncompressed_bytes"]
+        fs_key._compressed_bytes = fs_snapshot["key_compressed_bytes"]
+        fs_key._file_dirty = fs_snapshot["key_file_dirty"]
+
+        fs_data = fs_snapshot["data"]
+        fs_data._location = fs_snapshot["data_location"]
+        fs_data._slices = fs_snapshot["data_slices"]
+        fs_data._end = fs_snapshot["data_end"]
+        fs_data._allocation = fs_snapshot["data_allocation"]
+        fs_data._file_dirty = fs_snapshot["data_file_dirty"]
+
+        fs_header = fs_snapshot["fileheader"]
+        fs_header._end = fs_snapshot["fileheader_end"]
+        fs_header._free_location = fs_snapshot["fileheader_free_location"]
+        fs_header._free_num_bytes = fs_snapshot["fileheader_free_num_bytes"]
+        fs_header._free_num_slices = fs_snapshot["fileheader_free_num_slices"]
+        fs_header._info_location = fs_snapshot["fileheader_info_location"]
+        fs_header._info_num_bytes = fs_snapshot["fileheader_info_num_bytes"]
+        fs_header._begin_num_bytes = fs_snapshot["fileheader_begin_num_bytes"]
+        fs_header._file_dirty = fs_snapshot["fileheader_file_dirty"]
+
+        directory_snapshot = snapshot["directory"]
+        directory = directory_snapshot["directory"]
+        directory._datakey = directory_snapshot["datakey"]
+
+        directory_key = directory_snapshot["directory_key"]
+        directory_key._location = directory_snapshot["directory_key_location"]
+        directory_key._seek_location = directory_snapshot[
+            "directory_key_seek_location"
+        ]
+        directory_key._uncompressed_bytes = directory_snapshot[
+            "directory_key_uncompressed_bytes"
+        ]
+        directory_key._compressed_bytes = directory_snapshot[
+            "directory_key_compressed_bytes"
+        ]
+        directory_key._file_dirty = directory_snapshot[
+            "directory_key_file_dirty"
+        ]
+        if directory_snapshot["name_location"] is not None:
+            directory._name._location = directory_snapshot["name_location"]
+            directory._title._location = directory_snapshot["title_location"]
+
+        datakey = directory_snapshot["datakey"]
+        datakey._location = directory_snapshot["datakey_location"]
+        datakey._seek_location = directory_snapshot["datakey_seek_location"]
+        datakey._uncompressed_bytes = directory_snapshot[
+            "datakey_uncompressed_bytes"
+        ]
+        datakey._compressed_bytes = directory_snapshot[
+            "datakey_compressed_bytes"
+        ]
+        datakey._file_dirty = directory_snapshot["datakey_file_dirty"]
+
+        directory_data = directory_snapshot["data"]
+        directory_data._location = directory_snapshot["data_location"]
+        directory_data._allocation = directory_snapshot["data_allocation"]
+        directory_data._file_dirty = directory_snapshot["data_file_dirty"]
+        directory_data._dirty_keys = directory_snapshot["data_dirty_keys"]
+        directory_data._dirty_keys_start = directory_snapshot[
+            "data_dirty_keys_start"
+        ]
+        directory_data._keys_num_bytes = directory_snapshot["data_keys_num_bytes"]
+        directory_data._keys = directory_snapshot["data_keys"]
+        directory_data._keys_by_name = directory_snapshot["data_keys_by_name"]
+
+        directory_header = directory_snapshot["header"]
+        directory_header._location = directory_snapshot["header_location"]
+        directory_header._begin_location = directory_snapshot[
+            "header_begin_location"
+        ]
+        directory_header._begin_num_bytes = directory_snapshot[
+            "header_begin_num_bytes"
+        ]
+        directory_header._data_location = directory_snapshot["header_data_location"]
+        directory_header._data_num_bytes = directory_snapshot[
+            "header_data_num_bytes"
+        ]
+        directory_header._modified_on = directory_snapshot["header_modified_on"]
+        directory_header._file_dirty = directory_snapshot["header_file_dirty"]
+
+        file._trees.clear()
+        file._trees.update(snapshot["file_trees"])
 
     def write_anew(self, sink):
         key_num_bytes = uproot.reading._key_format_big.size + 6
