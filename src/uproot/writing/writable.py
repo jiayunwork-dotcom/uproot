@@ -37,6 +37,7 @@ import uproot.model
 import uproot.models.TObjString
 import uproot.sink.file
 import uproot.writing._cascade
+import uproot.writing._copytree
 from uproot._util import no_filter, no_rename
 
 
@@ -1459,6 +1460,39 @@ in file {self.file_path} in directory {self.path}"""
         at a time, in part because it avoids interpretation and decompression/recompression,
         and also because it collects TStreamerInfo from all of the data types and
         rewrites the output file's TStreamerInfo exactly once.
+
+        **Copying TTrees.** TTrees (but not RNTuples) can be copied: their TBaskets
+        are moved verbatim — the compressed data bytes of every basket are
+        byte-for-byte identical to the source — and the TTree/TBranch metadata
+        (including the fBasketSeek/fBasketEntry/fBasketBytes locator tables and
+        the fTotBytes/fZipBytes counters) are rebuilt to point at the new basket
+        positions. Entry boundaries, branch types, names, titles, and counter
+        (count-branch) relationships are preserved, as are per-branch
+        compression differences (the payload bytes are never recompressed).
+        Only the latest cycle of each selected object is copied, and copied
+        objects are always added as new cycles — preexisting cycles in the
+        destination are never overwritten.
+
+        The following TTree layouts are supported: flat TBranches with a single
+        TLeaf of a numeric or boolean type — numeric scalars, fixed-size
+        numeric arrays, and single-level variable-length numeric arrays
+        (including their count branches), in any mixture. RNTuples, object
+        branches (TBranchElement), string (TLeafC) branches, nested or split
+        branches, embedded TBaskets, shared counter branches, branches with
+        different basket counts or entry counts, and trees with cluster ranges,
+        aliases, friends, or user info are rejected with a
+        ``NotImplementedError`` before anything is written. Malformed source
+        metadata (including TBasket references beyond the end of the source
+        file) raises a ``ValueError``, also before anything is written; both
+        name the offending TTree and TBranch. Runtime I/O errors are
+        distinguished from these: they propagate as-is, the source file is
+        never modified, objects that were completely copied remain readable,
+        and an interrupted TTree copy never appears as a readable key in the
+        destination directory.
+
+        While copying, every read request to the source and every write request
+        to the destination is at most 1 MiB, and no more than 4 MiB of payload
+        data is held in memory at any time, regardless of basket or tree size.
         """
         if isinstance(source, WritableDirectory):
             raise NotImplementedError(
@@ -1467,6 +1501,8 @@ in file {self.file_path} in directory {self.path}"""
             )
         elif not isinstance(source, uproot.reading.ReadOnlyDirectory):
             raise TypeError("'source' must be a TDirectory")
+
+        uproot.writing._copytree.check_source_is_not_destination(source, self._file)
 
         old_names = source.keys(
             filter_name=filter_name, filter_classname=filter_classname, cycle=False
@@ -1482,19 +1518,40 @@ in file {source.file_path} in directory {source.path}"""
 
         keys = [source.key(x) for x in old_names]
 
-        for key in keys:
-            if key.fClassName == "TTree" or key.fClassName.split("::")[-1] == "RNTuple":
-                raise NotImplementedError(
-                    f"copy_from cannot copy {key.fClassName} objects yet"
-                )
-
         rename = uproot._util.regularize_rename(rename)
         new_names = [rename(x) for x in old_names]
+
+        # Plan TTree copies before writing anything to the destination: all
+        # type, metadata, and source-range checks happen in plan_tree_copy.
+        tree_plans = []
+        for old_name, new_name, old_key in zip(old_names, new_names, keys):
+            classname = old_key.fClassName
+            if classname == "TTree":
+                plan = uproot.writing._copytree.plan_tree_copy(
+                    source, old_name, old_key
+                )
+                tree_plans.append((new_name, plan))
+            elif classname.split("::")[-1] == "RNTuple":
+                raise NotImplementedError(
+                    f"copy_from cannot copy {classname} objects yet"
+                )
+
+        # Baskets with 4-byte TKey pointers can only be relocated to
+        # destination positions below 2 GB.
+        uproot.writing._copytree.check_fits_small_keys(
+            self._file,
+            tree_plans,
+            other_bytes=sum(
+                old_key.data_compressed_bytes + uproot.reading._key_format_big.size
+                for old_key in keys
+                if old_key.fClassName not in ("TDirectory", "TDirectoryFile", "TTree")
+            ),
+        )
 
         notifications = queue.Queue()
         ranges = {}
         for new_name, old_key in zip(new_names, keys):
-            if old_key.fClassName not in ("TDirectory", "TDirectoryFile"):
+            if old_key.fClassName not in ("TDirectory", "TDirectoryFile", "TTree"):
                 start = old_key.data_cursor.index
                 stop = start + old_key.data_compressed_bytes
                 ranges[start, stop] = new_name, old_key
@@ -1509,6 +1566,8 @@ in file {source.file_path} in directory {source.path}"""
                 classversion_pairs.update(batch)
 
         streamers = [source.file.streamer_named(c, v) for c, v in classversion_pairs]
+        if len(tree_plans) != 0:
+            streamers.extend(uproot.writing._copytree.tree_copy_streamers())
 
         self._file._cascading.streamers.update_streamers(self._file.sink, streamers)
 
@@ -1532,6 +1591,9 @@ in file {source.file_path} in directory {source.path}"""
             )
 
         for name, allocation in new_dirs.items():
+            if name == "":
+                # the root directory already exists
+                continue
             self.mkdir(
                 name,
                 initial_directory_bytes=max(
@@ -1558,6 +1620,21 @@ in file {source.file_path} in directory {source.path}"""
                 old_key.fTitle,
                 raw_data,
                 old_key.data_uncompressed_bytes,
+            )
+
+        for new_name, plan in tree_plans:
+            path = new_name.strip("/").split("/")
+            directory = self
+            for item in path[:-1]:
+                directory = directory[item]
+
+            cascading_tree = uproot.writing._copytree.execute_tree_copy(
+                directory, path[-1], plan
+            )
+            directory._file._new_tree(
+                WritableTree(
+                    (*directory._path, path[-1]), directory._file, cascading_tree
+                )
             )
 
     def update(self, pairs=None, **more_pairs):

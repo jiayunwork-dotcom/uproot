@@ -365,6 +365,7 @@ class Tree:
             "shape": branch_shape,
             "fTitle": title,
             "compression": self._directory.freesegments.fileheader.compression,
+            "fCompress": 0,
             "fBasketSize": 32000,
             "fEntryOffsetLen": 0 if counter is None else 1000,
             "fOffset": 0,
@@ -386,6 +387,7 @@ class Tree:
             "metadata_start": None,
             "basket_metadata_start": None,
             "tleaf_reference_number": None,
+            "tleaf_minimum_value": 0,
             "tleaf_maximum_value": 0,
             "tleaf_special_struct": None,
         }
@@ -955,7 +957,10 @@ class Tree:
             # https://github.com/root-project/root/blob/87a998d48803bc207288d90038e60ff148827664/tree/tree/src/TBasket.cxx#L560-L578
             # Without this, when small buffers are left uncompressed, ROOT complains about them not being compressed.
             # (I don't know where the "no, really, this is uncompressed" bit is.)
-            fCompress = 0
+            # datum["fCompress"] is 0 for trees written by Uproot; it may be
+            # non-zero for trees copied from another file by copy_from, in
+            # which case it carries the source TBranch's fCompress value.
+            fCompress = datum["fCompress"]
 
             out.append(
                 uproot.models.TBranch._tbranch13_format1.pack(
@@ -1142,7 +1147,11 @@ class Tree:
                 )
 
             # specialized TLeaf* members (fMinimum, fMaximum)
-            out.append(special_struct.pack(0, 0))
+            out.append(
+                special_struct.pack(
+                    datum["tleaf_minimum_value"], datum["tleaf_maximum_value"]
+                )
+            )
             datum["tleaf_special_struct"] = special_struct
 
             out[subany_tleaf_index] = (
@@ -1278,7 +1287,10 @@ class Tree:
             # https://github.com/root-project/root/blob/87a998d48803bc207288d90038e60ff148827664/tree/tree/src/TBasket.cxx#L560-L578
             # Without this, when small buffers are left uncompressed, ROOT complains about them not being compressed.
             # (I don't know where the "no, really, this is uncompressed" bit is.)
-            fCompress = 0
+            # datum["fCompress"] is 0 for trees written by Uproot; it may be
+            # non-zero for trees copied from another file by copy_from, in
+            # which case it carries the source TBranch's fCompress value.
+            fCompress = datum["fCompress"]
 
             sink.write(
                 position,
@@ -1364,7 +1376,7 @@ class Tree:
                 sink.write(
                     position,
                     datum["tleaf_special_struct"].pack(
-                        0,
+                        datum["tleaf_minimum_value"],
                         datum["tleaf_maximum_value"],
                     ),
                 )
